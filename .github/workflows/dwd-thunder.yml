@@ -1,0 +1,143 @@
+name: DWD Thunder Forecast
+
+# Builds the South African thunderstorm forecast the TrailTether hiking score
+# depends on. The published artifact is what makes the app's thunderstorm veto
+# reachable in South Africa at all; met.no supplies no thunder data here. See
+# the header of scripts/fetch_dwd_thunder.py for the full probe.
+#
+# WHY THIS RUNS IN CI RATHER THAN A SUPABASE EDGE FUNCTION. DWD's GRIB2 files
+# use packingType `grid_ccsds` (data representation template 42) — CCSDS/AEC
+# entropy coding — so decoding needs eccodes, which needs Python.
+#
+# A Deno path DOES now exist and was built and measured on 2026-08-15: the Rust
+# `grib` crate's pure-Rust `ccsds-unpack-with-rust-aec` backend compiles to a
+# 101 KB wasm module whose output is SHA256-identical to eccodes, at 117 ms per
+# forecast step against eccodes' 82 ms. It was rejected anyway, on a hard
+# platform limit rather than on the decoder:
+#
+#   Supabase Edge Functions cap CPU at 2 s per request, explicitly excluding
+#   async I/O. One run needs ~8.9 s of pure CPU (41 steps: ~4.8 s decoding,
+#   ~4.1 s bunzipping). That is 4.5x over. Splitting one step per invocation
+#   fits the limit but turns a safety feature into 41 chained stateful calls.
+#
+# WHY THIS REPO IS PUBLIC, AND SEPARATE FROM THE APP. GitHub Actions is metered
+# on private repos — 2,000 Linux minutes/month — and the TrailTether account
+# runs a $0 budget with "Stop usage: Yes" on every product. On 2026-08-15 the
+# allowance ran out and Actions stopped dead, taking CI and this four-times-daily
+# safety job down together. Actions is free and UNLIMITED on public repos, so
+# living here means a lightning forecast can never again be starved by a CI
+# allowance. Nothing proprietary is here: the app, the site, the backend and the
+# hiking score all stay private, and the artifact this publishes is already
+# world-readable at tiles.hilltrek.co.za because the app fetches it unauthenticated.
+#
+# Triggers are deliberately schedule + workflow_dispatch ONLY. With no
+# pull_request trigger, a fork can never run this and can never reach the R2
+# secrets.
+
+on:
+  schedule:
+    # DWD publishes a run roughly 3-4 h after its nominal time (00/06/12/18Z),
+    # so each of these sits comfortably after one. Times are UTC; SAST is +2.
+    - cron: '30 4,10,16,22 * * *'
+  workflow_dispatch:
+    inputs:
+      run:
+        description: 'ICON run to build, e.g. 2026080600 (blank = latest)'
+        required: false
+
+concurrency:
+  # A slow run must not overlap the next schedule and publish out of order.
+  group: dwd-thunder
+  cancel-in-progress: false
+
+jobs:
+  build:
+    name: Build & publish ZA thunder forecast
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      # The ecCodes C library. The PyPI wheel does not reliably carry it, and a
+      # missing decoder here would fail the run rather than corrupt output, but
+      # failing four times a day is still an outage.
+      - name: Install ecCodes
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y --no-install-recommends libeccodes0 libeccodes-dev
+          python -m pip install --upgrade pip
+          pip install numpy eccodes
+
+      # clat/clon are time-invariant — roughly 1.3 MB that never changes. Cached
+      # so only the tiny WW files move on a normal run.
+      - name: Cache ICON cell index
+        uses: actions/cache@v4
+        with:
+          path: .dwd-cache
+          key: dwd-icon-cells-v1
+
+      - name: Build forecast
+        run: |
+          python scripts/fetch_dwd_thunder.py \
+            --out out/za-thunder.json.gz \
+            --cache .dwd-cache \
+            ${{ github.event.inputs.run && format('--run {0}', github.event.inputs.run) || '' }}
+
+      # The script exits non-zero and writes nothing if too few forecast steps
+      # decoded, so reaching this point means the artifact is complete. Publish
+      # is deliberately a separate step: a partial build must never overwrite a
+      # good file with a quiet region-wide all-clear.
+      - name: Publish to R2
+        env:
+          RCLONE_CONFIG_R2_TYPE: s3
+          RCLONE_CONFIG_R2_PROVIDER: Cloudflare
+          RCLONE_CONFIG_R2_ACCESS_KEY_ID: ${{ secrets.R2_ACCESS_KEY_ID }}
+          RCLONE_CONFIG_R2_SECRET_ACCESS_KEY: ${{ secrets.R2_SECRET_ACCESS_KEY }}
+          RCLONE_CONFIG_R2_ENDPOINT: ${{ secrets.R2_ENDPOINT }}
+          RCLONE_CONFIG_R2_ACL: private
+        run: |
+          curl -fsSL https://rclone.org/install.sh | sudo bash
+          # --s3-no-check-bucket is REQUIRED: without it rclone attempts
+          # CreateBucket and R2 answers 403 AccessDenied. Same flag the tile
+          # publish uses.
+          rclone copyto out/za-thunder.json.gz r2:tt-tiles/weather/za-thunder.json.gz \
+            --s3-no-check-bucket --header-upload "Cache-Control: public, max-age=1800"
+          # Static grid: only changes if DWD changes the ICON grid, which would
+          # also change grid_id and force the app to refetch.
+          rclone copyto out/za-thunder-grid.json.gz r2:tt-tiles/weather/za-thunder-grid.json.gz \
+            --s3-no-check-bucket --header-upload "Cache-Control: public, max-age=604800"
+
+      # Keeps the last build inspectable even if the R2 step fails, so a
+      # publish problem can be told apart from a data problem.
+      #
+      # ⚠️ continue-on-error, added 2026-08-15, and the reason matters more than
+      # the flag. This is a DIAGNOSTIC step that runs AFTER the forecast has
+      # already been published to R2 — nothing a hiker sees depends on it. It
+      # was still allowed to fail the whole job.
+      #
+      # From 2026-08-07 it did exactly that, every run, with "Failed to
+      # CreateArtifact: Artifact storage quota has been hit" (the quota having
+      # been filled by 4c40fb4, which started uploading ~120 MB of APKs per push
+      # and was reverted in 7eb0f77). The forecast published correctly the whole
+      # time — verified against R2, whose object was last written 2026-08-14
+      # 22:55 UTC, matching the 22:30 cron.
+      #
+      # So this workflow showed RED for eight days while working. That is worse
+      # than a silent failure: a signal that is always red carries no
+      # information, and on 2026-08-15 it caused a genuine Actions billing
+      # outage to be read as "the thunder job, still broken". A red run here
+      # must mean the FORECAST failed.
+      - name: Upload artifact
+        if: always()
+        continue-on-error: true
+        uses: actions/upload-artifact@v4
+        with:
+          name: za-thunder
+          path: out/
+          retention-days: 7
+          if-no-files-found: warn

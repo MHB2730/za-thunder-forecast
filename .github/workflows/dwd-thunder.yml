@@ -50,6 +50,17 @@ concurrency:
   group: dwd-thunder
   cancel-in-progress: false
 
+# ACTION VERSIONS, bumped 2026-08-15 from checkout@v4 / setup-python@v5 /
+# cache@v4 / upload-artifact@v4. Those majors target Node 20, which GitHub
+# deprecated; runners were force-upgrading them to Node 24 and warning on every
+# run. Working, but a warning nobody can act on is noise — and this workflow has
+# already demonstrated what happens when its output stops carrying information.
+#
+# ⚠️ Pinned to MAJOR tags on purpose. A major bump can break inputs, so if a run
+# fails immediately after one of these moves, suspect the action before the
+# forecast: `retention-days` and `if-no-files-found` on upload-artifact are the
+# inputs most likely to shift.
+
 jobs:
   build:
     name: Build & publish ZA thunder forecast
@@ -57,9 +68,9 @@ jobs:
     timeout-minutes: 30
 
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
 
-      - uses: actions/setup-python@v5
+      - uses: actions/setup-python@v7
         with:
           python-version: '3.12'
 
@@ -76,7 +87,7 @@ jobs:
       # clat/clon are time-invariant — roughly 1.3 MB that never changes. Cached
       # so only the tiny WW files move on a normal run.
       - name: Cache ICON cell index
-        uses: actions/cache@v4
+        uses: actions/cache@v6
         with:
           path: .dwd-cache
           key: dwd-icon-cells-v1
@@ -135,7 +146,7 @@ jobs:
       - name: Upload artifact
         if: always()
         continue-on-error: true
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: za-thunder
           path: out/

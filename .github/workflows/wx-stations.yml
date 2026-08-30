@@ -55,8 +55,15 @@ jobs:
       - name: Validate the station list
         run: python scripts/fetch_wx_stations.py --stations stations/berg.json --dry-run
 
-      - name: Build feed
-        run: python scripts/fetch_wx_stations.py --stations stations/berg.json --out out/wx-stations.json.gz
+      # Builds BOTH the station feed and the 49-point synoptic grid: ~71 met.no
+      # requests at 1/second, so it takes a couple of minutes.
+      - name: Build feeds
+        run: |
+          python scripts/fetch_wx_stations.py \
+            --stations stations/berg.json \
+            --out out/wx-stations.json.gz \
+            --synoptic-out out/wx-synoptic.json.gz
+          ls -lh out/
 
       # The script exits non-zero and writes NOTHING when fewer than 80% of
       # stations return a forecast, so reaching this step means the artifact is
@@ -82,6 +89,11 @@ jobs:
           # point refetching sooner.
           rclone copyto out/wx-stations.json.gz r2:tt-tiles/weather/wx-stations.json.gz \
             --s3-no-check-bucket --header-upload "Cache-Control: public, max-age=1800"
+          # The synoptic grid — 49 met.no points the chart used to fetch from
+          # every browser. Published second and separately: a synoptic failure
+          # must not cost us a good station feed, which is what the board reads.
+          rclone copyto out/wx-synoptic.json.gz r2:tt-tiles/weather/wx-synoptic.json.gz \
+            --s3-no-check-bucket --header-upload "Cache-Control: public, max-age=1800"
 
       # Diagnostic only, and AFTER the publish. continue-on-error for the reason
       # documented at length in dwd-thunder.yml: from 2026-08-07 this exact step
@@ -94,5 +106,7 @@ jobs:
         uses: actions/upload-artifact@v7
         with:
           name: wx-stations
-          path: out/wx-stations.json.gz
+          path: |
+            out/wx-stations.json.gz
+            out/wx-synoptic.json.gz
           retention-days: 7

@@ -104,6 +104,27 @@ REQUEST_INTERVAL_S = 1.0
 # Below this share of stations succeeding, publish nothing at all.
 MIN_OK_FRACTION = 0.8
 
+# ── Synoptic grid ────────────────────────────────────────────────────────────
+# syn.js builds a pressure/front chart from a coarse grid of met.no points. In
+# the browser that is 49 REQUESTS PER BUILD, cached three hours — comfortably
+# the app's heaviest caller, and the single worst thing to distribute: a hundred
+# widgets would be ~39,000 anonymous met.no calls a day.
+#
+# ⚠️ THESE FOUR NUMBERS MUST MATCH syn.js EXACTLY (BOX, N, HOURS). The client
+# indexes the grid as r * N + c and assumes the same corners; a mismatch here
+# does not error, it draws a chart of the wrong places. Checked against
+# syn.js on 2026-08-30: BOX north -21.0 south -36.0 west 15.0 east 34.0, N = 7,
+# HOURS = 49.
+SYN_BOX = {"north": -21.0, "south": -36.0, "west": 15.0, "east": 34.0}
+SYN_N = 7
+SYN_HOURS = 49          # now + 48 h, the span syn.js reads
+SYN_API = "https://api.met.no/weatherapi/locationforecast/2.0/compact"
+
+# The chart is a synoptic overview of the whole country, not a station reading.
+# Losing a few nodes degrades it gracefully — the client already renders with
+# gaps — so this floor is lower than the station one on purpose.
+SYN_MIN_OK_FRACTION = 0.75
+
 
 def log(msg: str) -> None:
     print(msg, flush=True)
@@ -157,10 +178,88 @@ def validate(station: dict, box: dict) -> str:
     return ""
 
 
+def build_synoptic(out_path: str) -> int:
+    """Fetch the 7x7 synoptic grid. Returns 0 on success, non-zero to fail the job."""
+    lat_step = (SYN_BOX["north"] - SYN_BOX["south"]) / (SYN_N - 1)
+    lon_step = (SYN_BOX["east"] - SYN_BOX["west"]) / (SYN_N - 1)
+    total = SYN_N * SYN_N
+    log("synoptic: %dx%d grid = %d points" % (SYN_N, SYN_N, total))
+
+    nodes, ok = [], 0
+    for r in range(SYN_N):
+        for c in range(SYN_N):
+            idx = r * SYN_N + c
+            lat = SYN_BOX["north"] - r * lat_step
+            lon = SYN_BOX["west"] + c * lon_step
+            time.sleep(REQUEST_INTERVAL_S)
+            url = "%s?lat=%.3f&lon=%.3f" % (SYN_API, lat, lon)
+            body = None
+            for attempt in range(1, 3):
+                try:
+                    req = urllib.request.Request(url, headers={
+                        "User-Agent": USER_AGENT, "Accept": "application/json"})
+                    with urllib.request.urlopen(req, timeout=60) as resp:
+                        body = json.loads(resp.read().decode("utf-8"))
+                    break
+                except FETCH_ERRORS:
+                    if attempt == 2:
+                        break
+                    time.sleep(3)
+            if not body:
+                # A null node, not a missing one: syn.js indexes by r*N+c, so the
+                # slot must exist or every later node shifts and the chart draws
+                # the wrong places.
+                nodes.append(None)
+                continue
+            ts = (body.get("properties") or {}).get("timeseries") or []
+            if not ts:
+                nodes.append(None)
+                continue
+            # Trim to the span syn.js actually reads. It stops at HOURS anyway,
+            # so this changes nothing it sees and roughly halves the payload.
+            body["properties"]["timeseries"] = ts[:SYN_HOURS]
+            nodes.append(body)
+            ok += 1
+
+    frac = ok / float(total)
+    log("synoptic: %d/%d nodes (%.0f%%)" % (ok, total, frac * 100))
+    if frac < SYN_MIN_OK_FRACTION:
+        log("synoptic BELOW the %.0f%% floor — writing nothing, last good file stands."
+            % (SYN_MIN_OK_FRACTION * 100))
+        return 1
+
+    doc = {
+        "generated_at": dt.datetime.now(dt.timezone.utc)
+                          .replace(microsecond=0).isoformat().replace("+00:00", "Z"),
+        "source": "MET Norway Locationforecast 2.0 (compact)",
+        "licence": LICENCE,
+        "licence_url": LICENCE_URL,
+        "attribution_required": True,
+        "attribution_text": "Weather data from MET Norway (met.no), CC BY 4.0",
+        # Echoed so the client can assert the grid it is drawing matches the grid
+        # it was built for, rather than trusting two files to stay in step.
+        "box": SYN_BOX,
+        "n": SYN_N,
+        "hours": SYN_HOURS,
+        "node_count": ok,
+        "requested_count": total,
+        "nodes": nodes,     # index r*N+c, null where a node failed
+    }
+    os.makedirs(os.path.dirname(out_path) or ".", exist_ok=True)
+    payload = json.dumps(doc, separators=(",", ":"), ensure_ascii=False).encode("utf-8")
+    with gzip.open(out_path, "wb", compresslevel=9) as fh:
+        fh.write(payload)
+    log("wrote %s — %d KB raw, %d KB gzipped"
+        % (out_path, len(payload) // 1024, os.path.getsize(out_path) // 1024))
+    return 0
+
+
 def main() -> int:
     ap = argparse.ArgumentParser()
     ap.add_argument("--stations", default="stations/berg.json")
     ap.add_argument("--out", default="out/wx-stations.json.gz")
+    ap.add_argument("--synoptic-out", default="out/wx-synoptic.json.gz")
+    ap.add_argument("--skip-synoptic", action="store_true")
     ap.add_argument("--dry-run", action="store_true",
                     help="validate the station list and exit without calling met.no")
     args = ap.parse_args()
@@ -263,7 +362,13 @@ def main() -> int:
     if failed:
         log("NOTE: %d station(s) omitted and named in `failed`: %s"
             % (len(failed), ", ".join(failed)))
-    return 0
+
+    if args.skip_synoptic:
+        log("synoptic skipped by flag")
+        return 0
+    # Deliberately AFTER the stations are written. The station feed is what the
+    # board reads; a synoptic failure must not cost us a good station file.
+    return build_synoptic(args.synoptic_out)
 
 
 if __name__ == "__main__":

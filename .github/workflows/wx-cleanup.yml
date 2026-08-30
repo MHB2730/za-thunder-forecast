@@ -1,0 +1,41 @@
+name: Remove widget feeds from R2 (one-shot)
+
+# TEMPORARY. The PC-widget effort was dropped on 2026-08-30 and this deletes the
+# two objects it published. Delete this workflow file in the same change that
+# removes the ingest — it exists only because the R2 credentials live in this
+# repo's secrets and nowhere else.
+#
+# ⚠️ NAMES ARE HARDCODED, and deliberately not a wildcard. The same bucket path
+# holds za-thunder.json.gz and za-thunder-grid.json.gz, which are LIVE and feed
+# the app's lightning veto. A glob here would take them out.
+
+on:
+  workflow_dispatch:
+
+jobs:
+  purge:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - name: Delete the two widget feeds
+        env:
+          RCLONE_CONFIG_R2_TYPE: s3
+          RCLONE_CONFIG_R2_PROVIDER: Cloudflare
+          RCLONE_CONFIG_R2_ACCESS_KEY_ID: ${{ secrets.R2_ACCESS_KEY_ID }}
+          RCLONE_CONFIG_R2_SECRET_ACCESS_KEY: ${{ secrets.R2_SECRET_ACCESS_KEY }}
+          RCLONE_CONFIG_R2_ENDPOINT: ${{ secrets.R2_ENDPOINT }}
+        run: |
+          curl -fsSL https://rclone.org/install.sh | sudo bash
+          echo "--- before ---"
+          rclone lsf r2:tt-tiles/weather/ --s3-no-check-bucket
+          for f in wx-stations.json.gz wx-synoptic.json.gz; do
+            echo "deleting $f"
+            rclone deletefile "r2:tt-tiles/weather/$f" --s3-no-check-bucket || echo "  (already absent)"
+          done
+          echo "--- after ---"
+          rclone lsf r2:tt-tiles/weather/ --s3-no-check-bucket
+          # Fail loudly if the thunder feeds are not both still present.
+          rclone lsf r2:tt-tiles/weather/ --s3-no-check-bucket > /tmp/after.txt
+          grep -q '^za-thunder.json.gz$'      /tmp/after.txt || { echo "THUNDER FEED MISSING"; exit 1; }
+          grep -q '^za-thunder-grid.json.gz$' /tmp/after.txt || { echo "THUNDER GRID MISSING"; exit 1; }
+          echo "thunder feeds intact"

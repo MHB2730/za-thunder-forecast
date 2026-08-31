@@ -79,6 +79,23 @@ SAST = dt.timezone(dt.timedelta(hours=2))
 # instantaneous and accumulated fields. Names verified against a live .index.
 WANT = ("tp", "10fg", "2t")
 
+# ⚠️ ECMWF STOPS PUBLISHING `10fg` BEYOND +90 h. Verified against the live index
+# on 2026-08-31: at +093h it carries `2t` and `tp` and no `10fg`.
+#
+# Consequence in the first full run: steps +093h..+120h were all marked short,
+# so ECMWF dropped out of the ensemble entirely from about day 4 — visible as
+# days where `voting` falls to 1 or 2. That is SAFE (an incomplete model is
+# excluded, never counted as a clear vote) but it is stricter than it needs to
+# be: ECMWF can still see rain and cold out there, and only the GUST veto is
+# actually blind.
+#
+# The improvement is per-DAY abstention rather than per-model, so ECMWF keeps
+# voting on precipitation and temperature past +90 h and abstains on gusts
+# alone — the same treatment GFS already gets for thunder and snow. Not
+# implemented: `abstains` is model-level in the artifact today and the UI reads
+# it that way, so this is a schema change, not a one-line fix.
+GUST_HORIZON_H = 90
+
 FETCH_ERRORS = (
     urllib.error.URLError,
     urllib.error.HTTPError,

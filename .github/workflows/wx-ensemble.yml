@@ -83,11 +83,19 @@ jobs:
       # Cheap, offline, and they pin the two things most able to be silently
       # wrong: the ported veto ladder and the GFS accumulation arithmetic.
       #
-      # ⚠️ test_veto_parity.py SKIPS here and exits 0. It needs metno.js from
-      # the private trailtether repo, which is not checked out in this
-      # workflow, so it is a developer-machine test today. That is a real gap —
-      # the ladder is the piece every model's verdict runs through — and
-      # closing it needs a read token for that repo.
+      # ⚠️ test_veto_parity.py SKIPS here and exits 0 — it needs metno.js from
+      # the PRIVATE trailtether repo, which cannot be checked out here without
+      # storing a private-repo read token in a public repo's secrets.
+      #
+      # It is NOT unpinned: as of 2026-08-31 it runs in trailtether's own CI
+      # (.github/workflows/veto-parity.yml), which has metno.js locally and can
+      # check THIS repo out with no credentials because it is public. That
+      # workflow also runs nightly, which is what catches a change to veto.py
+      # made here — a commit in this repo cannot trigger a workflow in that one.
+      #
+      # So the line below is a no-op in CI by design. Leave it: it still runs on
+      # a developer machine, where it is the fastest way to catch drift before
+      # pushing.
       - name: Tests
         run: |
           python scripts/test_gfs_accumulation.py

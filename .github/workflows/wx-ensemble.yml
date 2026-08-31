@@ -1,0 +1,133 @@
+name: wx-ensemble
+
+# Builds the model-agreement forecast (wx-ensemble.json.gz) for the
+# /trailtether/ page: TrailTether's hazard-veto ladder run over ICON, GFS and
+# ECMWF, reporting how many independent models condemn each day.
+#
+# ⚠️ DELIBERATELY A SEPARATE WORKFLOW FROM dwd-thunder.yml, NOT A STEP IN IT.
+# Two reasons, and both were learned the hard way in that file:
+#
+#   1. The thunder feed is a LIVE SAFETY DEPENDENCY — metno.js reads
+#      `dwd_thunder_code`, and it is the only thing that makes the storm veto
+#      reachable in South Africa. This ensemble is a product feature on a
+#      marketing page. A failure here must never delay or block that.
+#   2. dwd-thunder.yml carries a long note ending "a red run here must mean the
+#      FORECAST failed", written after that workflow showed red for eight days
+#      while working perfectly, and a real billing outage was consequently read
+#      as "the thunder job, still broken". Adding a second product to that job
+#      would break the signal in both directions: continue-on-error would hide
+#      genuine ensemble failures, and letting it fail the job would put a
+#      marketing feature's outage on a safety feed's status light.
+#
+# Separate workflows, separate signals. Red here means the ensemble failed.
+
+on:
+  schedule:
+    # Twice a day, after the 00Z and 12Z ICON runs publish (DWD is ~3-4 h
+    # behind its nominal time). Times are UTC; SAST is +2.
+    #
+    # ⚠️ TWICE, not four times like the thunder feed, and that is a cost
+    # decision rather than an oversight. ICON global has no subregion or
+    # variable filter, so the four fields cost ~530 MB per run against the
+    # thunder feed's single WW field. This is a FIVE-DAY OUTLOOK for trip
+    # planning — it does not get meaningfully better by rebuilding every six
+    # hours, and the bandwidth is somebody else's free service.
+    - cron: '45 5,17 * * *'
+  workflow_dispatch:
+    inputs:
+      hours:
+        description: 'Forecast horizon in hours (default 120)'
+        required: false
+      models:
+        description: 'Comma-separated: icon,gfs,ecmwf'
+        required: false
+
+concurrency:
+  # A slow run must not overlap the next schedule and publish out of order.
+  group: wx-ensemble
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    name: Build & publish the model-agreement forecast
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: actions/setup-python@v7
+        with:
+          python-version: '3.12'
+
+      # Same install as dwd-thunder.yml: the PyPI wheel does not reliably carry
+      # the ecCodes C library.
+      - name: Install ecCodes
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y --no-install-recommends libeccodes0 libeccodes-dev
+          python -m pip install --upgrade pip
+          pip install numpy eccodes
+
+      # Shared with dwd-thunder.yml by cache key: clat/clon are time-invariant
+      # and identical for both, so whichever job runs first warms it.
+      - name: Cache ICON cell index
+        uses: actions/cache@v6
+        with:
+          path: .dwd-cache
+          key: dwd-icon-cells-v1
+
+      # Cheap, offline, and they pin the two things most able to be silently
+      # wrong: the ported veto ladder and the GFS accumulation arithmetic.
+      #
+      # ⚠️ test_veto_parity.py SKIPS here and exits 0. It needs metno.js from
+      # the private trailtether repo, which is not checked out in this
+      # workflow, so it is a developer-machine test today. That is a real gap —
+      # the ladder is the piece every model's verdict runs through — and
+      # closing it needs a read token for that repo.
+      - name: Tests
+        run: |
+          python scripts/test_gfs_accumulation.py
+          python scripts/test_veto_parity.py
+
+      - name: Build ensemble
+        run: |
+          python scripts/build_ensemble.py \
+            --out out/wx-ensemble.json.gz \
+            ${{ github.event.inputs.hours && format('--hours {0}', github.event.inputs.hours) || '' }} \
+            ${{ github.event.inputs.models && format('--models {0}', github.event.inputs.models) || '' }}
+
+      # build_ensemble.py exits non-zero and writes nothing when fewer than
+      # --min-models models survive, so reaching this step means the artifact
+      # counts a real majority. Publishing is separate for the same reason it
+      # is in dwd-thunder.yml: a partial build must never overwrite a good file
+      # with one that UNDER-COUNTS the models condemning a day.
+      - name: Publish to R2
+        env:
+          RCLONE_CONFIG_R2_TYPE: s3
+          RCLONE_CONFIG_R2_PROVIDER: Cloudflare
+          RCLONE_CONFIG_R2_ACCESS_KEY_ID: ${{ secrets.R2_ACCESS_KEY_ID }}
+          RCLONE_CONFIG_R2_SECRET_ACCESS_KEY: ${{ secrets.R2_SECRET_ACCESS_KEY }}
+          RCLONE_CONFIG_R2_ENDPOINT: ${{ secrets.R2_ENDPOINT }}
+          RCLONE_CONFIG_R2_ACL: private
+        run: |
+          curl -fsSL https://rclone.org/install.sh | sudo bash
+          # --s3-no-check-bucket is REQUIRED: without it rclone attempts
+          # CreateBucket and R2 answers 403 AccessDenied.
+          rclone copyto out/wx-ensemble.json.gz r2:tt-tiles/weather/wx-ensemble.json.gz \
+            --s3-no-check-bucket --header-upload "Cache-Control: public, max-age=3600"
+
+      # Diagnostic only, and it runs AFTER publishing — see the long note on the
+      # matching step in dwd-thunder.yml about why this must never fail the job.
+      - name: Upload artifact
+        if: always()
+        continue-on-error: true
+        uses: actions/upload-artifact@v7
+        with:
+          name: wx-ensemble
+          path: out/
+          retention-days: 7
+          if-no-files-found: warn

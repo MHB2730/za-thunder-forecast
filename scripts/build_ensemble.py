@@ -86,6 +86,11 @@ def _verdict(day: dict, i: int, meta: dict) -> dict:
         weather_code=codes[i] if codes else None,
         temp_min=day["temp_min"][i],
         thunder_assessed=bool(meta["thunder_assessed"]),
+        # PER-DAY, not per-model: ECMWF stops publishing wind gust beyond
+        # +90 h, so the same model votes on wind early in the week and
+        # abstains later. Defaults True so models that always carry a gust
+        # are unaffected.
+        gust_assessed=bool(day.get("gust_assessed", True)),
     )
     b = v.binding
     return {
@@ -96,8 +101,13 @@ def _verdict(day: dict, i: int, meta: dict) -> dict:
         "severity": b.severity if b else None,
         # The raw fields, so the page can show WHY without re-deriving them and
         # so a disagreement can be inspected rather than merely counted.
+        # Hazards this model could not look at on THIS day. The page must
+        # render these as abstentions; an omitted key would read as a clear
+        # vote, which is the fabricated all-clear the feed exists to remove.
+        "unassessed": v.unassessed,
         "precip_mm": round(day["precip_sum"][i], 2),
-        "gust_kmh": round(day["wind_gust_max"][i], 1),
+        "gust_kmh": (round(day["wind_gust_max"][i], 1)
+                     if day["wind_gust_max"][i] is not None else None),
         "temp_min_c": (round(day["temp_min"][i], 1)
                        if day["temp_min"][i] is not None else None),
     }
@@ -183,8 +193,11 @@ def main() -> int:
                 "steps_decoded": r["steps_decoded"],
                 "steps_requested": r["steps_requested"],
                 "spatial": r.get("spatial"),
-                # What this model could NOT vote on. The UI must render these
-                # as abstentions, never as agreement.
+                # What this model can NEVER vote on, whatever the day. This is
+                # the FLOOR: a model may additionally abstain on a given day —
+                # ECMWF loses wind gust beyond +90 h — and those are carried
+                # per-day in each verdict's `unassessed`. Reading only this
+                # list would report ECMWF as a wind voter on day 6.
                 "abstains": [k for k, ok in (("thunder", r["thunder_assessed"]),
                                              ("snow", r["snow_assessed"])) if not ok],
             }

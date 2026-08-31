@@ -111,6 +111,11 @@ class Verdict:
 
     cap: float
     factors: list[Factor] = field(default_factory=list)
+    # Hazards this model could not look at AT ALL for this day. Never empty
+    # because nothing was found — empty means everything was assessed. The
+    # difference is the whole point: "no gale forecast" and "nobody looked for
+    # a gale" must not render the same way.
+    unassessed: list[str] = field(default_factory=list)
 
     @property
     def condemns(self) -> bool:
@@ -132,6 +137,7 @@ def evaluate_hazards(
     weather_code: Optional[int],
     temp_min: Optional[float],
     thunder_assessed: bool,
+    gust_assessed: bool = True,
 ) -> Verdict:
     """Run the veto ladder. Order matters — see `veto()` below.
 
@@ -141,6 +147,7 @@ def evaluate_hazards(
     answer rather than an error.
     """
     factors: list[Factor] = []
+    unassessed: list[str] = []
     cap = 10.0
     binding_at: Optional[int] = None
 
@@ -183,9 +190,23 @@ def evaluate_hazards(
         veto(7, "Lightning not assessed",
              "No thunder forecast is published for this region — on a wet day "
              "treat an afternoon storm as possible", SEV_CAUTION)
+    if not thunder_assessed:
+        unassessed.append("thunder")
 
     # ── Wind ───────────────────────────────────────────────────────────────
-    if g >= 75:
+    # ⚠️ `gust_assessed` exists because `g = wind_gust_max or 0.0` above turns a
+    # MISSING gust into a confident 0 km/h — a fabricated all-clear on the veto
+    # that caps a day at 1.0. ECMWF stops publishing 10fg beyond +90 h, so this
+    # is a live case, not a hypothetical.
+    #
+    # An unknown gust does NOT get a cap of its own. metno.js only caps for an
+    # unassessed hazard when something else makes it dangerous (the "Lightning
+    # not assessed" rung fires only on a wet day), and inventing a ceiling for
+    # "we did not look" would manufacture a hazard rather than report one. It is
+    # recorded as unassessed instead, and the UI must show that.
+    if not gust_assessed:
+        unassessed.append("gusts")
+    elif g >= 75:
         veto(1, f"Gusts {js_round(g)} km/h",
              "Violent gale — you can be blown off your feet on a ridge",
              SEV_SEVERE)
@@ -235,7 +256,13 @@ def evaluate_hazards(
                  "Cold start — frost is possible before the sun gets on it",
                  SEV_CAUTION)
 
-        if tmin <= 10 and p > 1 and g > 25:
+        # Needs all three of temperature, rain AND wind, so an unknown gust
+        # makes it unevaluable. Reading `g` as 0 here would silently exempt
+        # exactly the freezing wet day the trap was built for.
+        if not gust_assessed:
+            if "wet-cold" not in unassessed:
+                unassessed.append("wet-cold")
+        elif tmin <= 10 and p > 1 and g > 25:
             veto(3, "Wet, cold and windy",
                  "The classic hypothermia combination — worse than it looks",
                  SEV_SEVERE)
@@ -248,4 +275,5 @@ def evaluate_hazards(
         factors[binding_at].binding = True
 
     factors.sort(key=lambda f: (not f.binding, -f.severity))
-    return Verdict(cap=max(0.0, min(10.0, cap)), factors=factors)
+    return Verdict(cap=max(0.0, min(10.0, cap)), factors=factors,
+                   unassessed=unassessed)

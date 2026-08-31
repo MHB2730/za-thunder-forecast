@@ -231,7 +231,12 @@ def fetch_daily(
         tp, gust, t2 = f.get("tp"), f.get("10fg"), f.get("2t")
         if tp is not None and sel is None:
             sel = cells_within_km(points, tp[1], tp[2], radius_km)
-        if tp is None or gust is None or t2 is None:
+        # ⚠️ `gust` is NOT required. ECMWF stops publishing 10fg beyond +90 h
+        # (see GUST_HORIZON_H), and requiring it dropped the whole step, which
+        # dropped ECMWF out of the ensemble from about day 4 even though it
+        # could still see rain and cold. tp and 2t remain mandatory: without
+        # them there is no verdict left to give.
+        if tp is None or t2 is None:
             log(f"  ECMWF +{s:03d}h short — {key} -> incomplete")
             prev_tp = None
             continue
@@ -241,9 +246,15 @@ def fetch_daily(
             "wind_gust_max": [0.0] * len(points),
             "temp_min": [None] * len(points),
             "steps": 0,
+            # Counted separately from `steps` so a day that loses the gust
+            # PART-WAY through is not reported as assessed. A daily maximum
+            # taken over some of the day is an UNDER-estimate, and under-
+            # estimating gust is the direction that hides a hazard.
+            "gust_steps": 0,
         })
         tp_pt = [reduce_median(tp[0], sel[i]) for i in range(len(points))]
-        gust_pt = [reduce_median(gust[0], sel[i]) for i in range(len(points))]
+        gust_pt = ([reduce_median(gust[0], sel[i]) for i in range(len(points))]
+                   if gust is not None else None)
         t2_pt = [reduce_median(t2[0], sel[i]) for i in range(len(points))]
         for i in range(len(points)):
             # ⚠️ ECMWF `tp` accumulates from the START OF THE RUN and is in
@@ -254,17 +265,26 @@ def fetch_daily(
             cur_m = tp_pt[i]
             inc_m = cur_m if prev_tp is None else max(0.0, cur_m - prev_tp[i])
             d["precip_sum"][i] += inc_m * 1000.0
-            d["wind_gust_max"][i] = max(d["wind_gust_max"][i], gust_pt[i] * 3.6)
+            if gust_pt is not None:
+                d["wind_gust_max"][i] = max(d["wind_gust_max"][i], gust_pt[i] * 3.6)
             c = t2_pt[i] - 273.15
             d["temp_min"][i] = c if d["temp_min"][i] is None else min(d["temp_min"][i], c)
         prev_tp = tp_pt
         d["steps"] += 1
+        if gust_pt is not None:
+            d["gust_steps"] += 1
         got += 1
         if got % 5 == 0:
             log(f"  ECMWF +{s:03d}h ok ({got}/{len(steps)})")
 
     for key, d in per_day.items():
         d["complete"] = d["steps"] == expected.get(key, 0)
+        # Assessed only if EVERY step of the day carried a gust — see the note
+        # on `gust_steps`. Days past +90 h come back False and the ladder then
+        # abstains on wind instead of reading a missing gust as 0 km/h.
+        d["gust_assessed"] = d["gust_steps"] == d["steps"] and d["steps"] > 0
+        if not d["gust_assessed"]:
+            d["wind_gust_max"] = [None] * len(points)
 
     return {
         "model": MODEL,

@@ -91,6 +91,7 @@ jobs:
       - name: Tests
         run: |
           python scripts/test_gfs_accumulation.py
+          python scripts/test_gust_abstention.py
           python scripts/test_veto_parity.py
 
       - name: Build ensemble

@@ -54,12 +54,18 @@ import datetime as dt
 import http.client
 import json
 import os
+import sys
 import tempfile
 import time
 import urllib.error
 import urllib.request
 
 import eccodes as ec
+
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+from spatial import (  # noqa: E402
+    DEFAULT_RADIUS_KM, cells_within_km, describe, reduce_max, reduce_median,
+)
 
 BASE = "https://data.ecmwf.int/forecasts"
 UA = "TrailTether/2.0 (https://trailtether.app contact@hilltrek.co.za)"
@@ -126,10 +132,11 @@ def _sample_messages(raw: bytes, points: list[tuple[float, float]]) -> dict:
                     break
                 try:
                     name = ec.codes_get(gid, "shortName")
-                    vals = [
-                        ec.codes_grib_find_nearest(gid, la, lo, False, 1)[0].value
-                        for (la, lo) in points
-                    ]
+                    vals = (
+                        ec.codes_get_array(gid, 'values'),
+                        ec.codes_get_array(gid, 'latitudes'),
+                        ec.codes_get_array(gid, 'longitudes'),
+                    )
                     out.setdefault(name, vals)
                 finally:
                     ec.codes_release(gid)
@@ -171,6 +178,7 @@ def fetch_daily(
     run_day: str | None = None,
     cycle: int = 0,
     hours: int = 120,
+    radius_km: float = DEFAULT_RADIUS_KM,
     log=print,
 ) -> dict:
     """Daily precip sum, max gust and min temp per point, bucketed to SAST.
@@ -186,6 +194,7 @@ def fetch_daily(
     )
 
     steps = list(range(3, hours + 1, 3))
+    sel = None
     prev_tp: list[float] | None = None
     per_day: dict[str, dict] = {}
     expected: dict[str, int] = {}
@@ -203,6 +212,8 @@ def fetch_daily(
             continue
 
         tp, gust, t2 = f.get("tp"), f.get("10fg"), f.get("2t")
+        if tp is not None and sel is None:
+            sel = cells_within_km(points, tp[1], tp[2], radius_km)
         if tp is None or gust is None or t2 is None:
             log(f"  ECMWF +{s:03d}h short — {key} -> incomplete")
             prev_tp = None
@@ -214,19 +225,22 @@ def fetch_daily(
             "temp_min": [None] * len(points),
             "steps": 0,
         })
+        tp_pt = [reduce_median(tp[0], sel[i]) for i in range(len(points))]
+        gust_pt = [reduce_median(gust[0], sel[i]) for i in range(len(points))]
+        t2_pt = [reduce_median(t2[0], sel[i]) for i in range(len(points))]
         for i in range(len(points)):
             # ⚠️ ECMWF `tp` accumulates from the START OF THE RUN and is in
             # METRES, not mm. Both are easy to get wrong in the direction that
             # invents rain: forgetting the difference multiplies a day's total
             # by the number of steps, and forgetting the unit multiplies by
             # 1000. The empirical check is in the commit message.
-            cur_m = tp[i]
+            cur_m = tp_pt[i]
             inc_m = cur_m if prev_tp is None else max(0.0, cur_m - prev_tp[i])
             d["precip_sum"][i] += inc_m * 1000.0
-            d["wind_gust_max"][i] = max(d["wind_gust_max"][i], gust[i] * 3.6)
-            c = t2[i] - 273.15
+            d["wind_gust_max"][i] = max(d["wind_gust_max"][i], gust_pt[i] * 3.6)
+            c = t2_pt[i] - 273.15
             d["temp_min"][i] = c if d["temp_min"][i] is None else min(d["temp_min"][i], c)
-        prev_tp = tp
+        prev_tp = tp_pt
         d["steps"] += 1
         got += 1
         if got % 5 == 0:
@@ -245,5 +259,6 @@ def fetch_daily(
         # No WMO code used — see the module note on mucape and ptype.
         "thunder_assessed": False,
         "snow_assessed": False,
+        "spatial": describe(sel, radius_km) if sel else None,
         "days": per_day,
     }

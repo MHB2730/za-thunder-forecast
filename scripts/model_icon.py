@@ -42,11 +42,12 @@ import datetime as dt
 import os
 import sys
 
-import numpy as np
-
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from fetch_dwd_thunder import (  # noqa: E402
     BASE, FETCH_ERRORS, SAST, cell_index, fetch, grib_values, latest_run,
+)
+from spatial import (  # noqa: E402
+    DEFAULT_RADIUS_KM, cells_within_km, describe, reduce_max, reduce_median,
 )
 
 MODEL = "DWD ICON global"
@@ -68,65 +69,13 @@ def _url(run: str, step: int, var: str) -> str:
             f"icon_global_icosahedral_single-level_{run}_{step:03d}_{token}.grib2.bz2")
 
 
-def nearest_cells(points: list[tuple[float, float]],
-                  lat: np.ndarray, lon: np.ndarray) -> list[int]:
-    """Index into the ZA cell arrays of the nearest ICON cell to each point.
-
-    Equirectangular distance is fine at this latitude and spacing: ICON global
-    is ~13 km and the error from ignoring the ellipsoid is metres. The existing
-    thunder feed reports 0.78 km from Cathedral Peak to its nearest cell, which
-    is the scale that matters here.
-
-    ⚠️ NEAREST-NEIGHBOUR GUSTS ARE NOISY ON THE ESCARPMENT. UNRESOLVED — read
-    this before trusting an ICON gust outlier.
-
-    Measured 2026-08-31, run 2026083100 +6 h, VMAX_10M:
-
-        Cathedral  nearest cell 1.71 km   8 nearest cells: 5.4 4.5 13.3 1.5
-                                                           1.8 15.4 2.2 16.4 m/s
-        Sani Pass  nearest cell 8.18 km   8 nearest cells: 28.0 19.8 19.7 27.0
-                                                           16.6 21.9 3.4 6.0 m/s
-        ZA-wide: median 3.4, p99 12.4, max 28.0 m/s
-
-    Sani's nearest cell IS the windiest cell in South Africa, and neighbours
-    swing between 1.5 and 16.4 m/s within ~25 km. That is the Drakensberg
-    escarpment: a 1,000 m wall inside a 13 km grid box, where exposure — and so
-    gust — changes completely between adjacent cells. It produced ICON 102.7
-    km/h at Sani against GFS 30.0 and ECMWF 38.1, which would fire the cap-1
-    "violent gale" veto on its own.
-
-    THIS IS NOT A UNITS BUG. Cathedral agrees across all three models
-    (19.6 / 17.4 / 26.8 km/h); a unit error would inflate both points.
-
-    Why it is NOT silently smoothed: averaging the k nearest cells would fix
-    the number and break the claim. ICON is ~13 km, GFS and ECMWF are 0.25°
-    (~28 km), so "median of the 4 nearest" covers a different physical area per
-    model — the ensemble would then be measuring the sampling, exactly the
-    failure the reduction note in model_ecmwf.py exists to prevent.
-
-    So the honest reading today: at escarpment points, part of ICON's
-    disagreement is RESOLUTION, not meteorology. A panel that renders it as
-    "ICON says violent gale" would overstate it. Options are (a) present ICON's
-    gust with a terrain-noise caveat, (b) pick location coordinates that sit in
-    representative cells rather than on the lip, or (c) adopt one spatial
-    reduction expressed in KILOMETRES rather than cells, applied identically to
-    every model. (c) is the principled fix and is not implemented — it is an
-    owner decision, and it is recorded in SCOPE-wx-ensemble.md.
-    """
-    out = []
-    for la, lo in points:
-        dy = lat - la
-        dx = (lon - lo) * np.cos(np.radians(la))
-        out.append(int(np.argmin(dy * dy + dx * dx)))
-    return out
-
-
 def fetch_daily(
     points: list[tuple[float, float]],
     *,
     run: str | None = None,
     hours: int = 120,
     cache: str = ".dwd-cache",
+    radius_km: float = DEFAULT_RADIUS_KM,
     log=print,
 ) -> dict:
     """Daily precip sum, max gust, min temp and worst WMO code, bucketed to SAST.
@@ -138,7 +87,9 @@ def fetch_daily(
     run = run or latest_run(dt.datetime.now(dt.timezone.utc))
     run_dt = dt.datetime.strptime(run, "%Y%m%d%H").replace(tzinfo=dt.timezone.utc)
     idx, lat, lon = cell_index(run, cache)
-    sel = nearest_cells(points, lat, lon)
+    # ONE reduction, shared with every other model — see spatial.py. Replaced
+    # nearest-neighbour, which put Sani Pass on the windiest cell in the country.
+    sel = cells_within_km(points, lat, lon, radius_km)
 
     steps = list(range(3, hours + 1, 3))
     per_day: dict[str, dict] = {}
@@ -159,8 +110,7 @@ def fetch_daily(
             except FETCH_ERRORS as e:
                 missing = f"{var} ({type(e).__name__})"
                 break
-            za = arr[idx]
-            vals[var] = [float(za[i]) for i in sel]
+            vals[var] = arr[idx]
         if missing:
             log(f"  ICON +{s:03d}h MISSING {missing} — {key} -> incomplete")
             # A gap breaks the precipitation difference across it.
@@ -180,18 +130,19 @@ def fetch_daily(
             # multiplies the day's total by the step count. Verified against the
             # live file rather than assumed — the same check that caught GFS's
             # overlapping windows and ECMWF's metres.
-            cur = vals["precip"][i]
+            cur = reduce_median(vals["precip"], sel[i])
             inc = cur if prev_precip is None else max(0.0, cur - prev_precip[i])
             d["precip_sum"][i] += inc
             # VMAX_10M is a maximum over the preceding interval, in m/s.
-            d["wind_gust_max"][i] = max(d["wind_gust_max"][i], vals["gust"][i] * 3.6)
-            c = vals["t2m"][i] - 273.15
+            d["wind_gust_max"][i] = max(
+                d["wind_gust_max"][i], reduce_median(vals["gust"], sel[i]) * 3.6)
+            c = reduce_median(vals["t2m"], sel[i]) - 273.15
             d["temp_min"][i] = c if d["temp_min"][i] is None else min(d["temp_min"][i], c)
-            # Worst code of the day, matching fetch_dwd_thunder.py's reduction.
-            w = int(vals["ww"][i])
+            # MAX, not median: thunder 15 km away is a real hazard on a ridge.
+            w = int(reduce_max(vals["ww"], sel[i]))
             if w > d["weather_code"][i]:
                 d["weather_code"][i] = w
-        prev_precip = vals["precip"]
+        prev_precip = [reduce_median(vals["precip"], sel[i]) for i in range(len(points))]
         d["steps"] += 1
         got += 1
         if got % 5 == 0:
@@ -210,5 +161,6 @@ def fetch_daily(
         # The reason ICON is here: it is the only model that can vote on these.
         "thunder_assessed": True,
         "snow_assessed": True,
+        "spatial": describe(sel, radius_km),
         "days": per_day,
     }

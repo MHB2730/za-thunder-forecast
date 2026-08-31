@@ -47,11 +47,17 @@ from __future__ import annotations
 import datetime as dt
 import http.client
 import os
+import sys
 import tempfile
 import urllib.error
 import urllib.request
 
 import eccodes as ec
+
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+from spatial import (  # noqa: E402
+    DEFAULT_RADIUS_KM, cells_within_km, describe, reduce_max, reduce_median,
+)
 
 FILTER = "https://nomads.ncep.noaa.gov/cgi-bin/filter_gfs_0p25_1hr.pl"
 UA = "TrailTether/2.0 (https://trailtether.app contact@hilltrek.co.za)"
@@ -161,10 +167,11 @@ def _sample(raw: bytes, points: list[tuple[float, float]]) -> dict[str, list[flo
                     if name == "t" and lvl != "heightAboveGround":
                         continue
                     key = f"{name}|{rng}" if name == "tp" else name
-                    vals = [
-                        ec.codes_grib_find_nearest(gid, la, lo, False, 1)[0].value
-                        for (la, lo) in points
-                    ]
+                    vals = (
+                        ec.codes_get_array(gid, 'values'),
+                        ec.codes_get_array(gid, 'latitudes'),
+                        ec.codes_get_array(gid, 'longitudes'),
+                    )
                     # Keep the SHORTEST window when a name repeats: NOMADS
                     # sends tp twice, and the since-run window is the wrong one.
                     if key not in out:
@@ -194,6 +201,7 @@ def fetch_daily(
     run_day: str | None = None,
     cycle: int = 0,
     hours: int = 120,
+    radius_km: float = DEFAULT_RADIUS_KM,
     log=print,
 ) -> dict:
     """Daily precip sum, max gust and min temp per point, bucketed to SAST.
@@ -218,6 +226,9 @@ def fetch_daily(
     bbox = (min(lats) - pad, min(lons) - pad, max(lats) + pad, max(lons) + pad)
 
     steps = list(range(3, hours + 1, 3))
+    # Computed once from the first decoded grid: the grid is constant across
+    # steps, and recomputing per step would be wasted work, not safety.
+    sel = None
     tp_acc: dict[int, list[float]] = {}
     per_day: dict[str, dict] = {}
     expected: dict[str, int] = {}
@@ -236,11 +247,20 @@ def fetch_daily(
         tp = _pick_tp(sampled, s)
         gust = sampled.get("gust")
         t2 = sampled.get("2t")
+        if tp is not None and sel is None:
+            # SAME kilometre-radius reduction as every other model — spatial.py.
+            sel = cells_within_km(points, tp[1], tp[2], radius_km)
         if tp is None or gust is None or t2 is None:
             log(f"  GFS +{s:03d}h short (tp={tp is not None} "
                 f"gust={gust is not None} 2t={t2 is not None}) — {key} -> incomplete")
             continue
-        tp_acc[s] = tp
+        # Reduce the grids to one representative value per point BEFORE any
+        # arithmetic, so the accumulation subtraction operates on the same
+        # quantity it will be reported as.
+        tp_pt = [reduce_median(tp[0], sel[i]) for i in range(len(points))]
+        gust_pt = [reduce_median(gust[0], sel[i]) for i in range(len(points))]
+        t2_pt = [reduce_median(t2[0], sel[i]) for i in range(len(points))]
+        tp_acc[s] = tp_pt
 
         d = per_day.setdefault(key, {
             "precip_sum": [0.0] * len(points),
@@ -257,9 +277,9 @@ def fetch_daily(
             if add is not None:
                 d["precip_sum"][i] += add
             # m/s -> km/h
-            d["wind_gust_max"][i] = max(d["wind_gust_max"][i], gust[i] * 3.6)
+            d["wind_gust_max"][i] = max(d["wind_gust_max"][i], gust_pt[i] * 3.6)
             # K -> °C
-            c = t2[i] - 273.15
+            c = t2_pt[i] - 273.15
             d["temp_min"][i] = c if d["temp_min"][i] is None else min(d["temp_min"][i], c)
         d["steps"] += 1
         got += 1
@@ -280,5 +300,6 @@ def fetch_daily(
         # payload rather than assumed by the consumer.
         "thunder_assessed": False,
         "snow_assessed": False,
+        "spatial": describe(sel, radius_km) if sel else None,
         "days": per_day,
     }

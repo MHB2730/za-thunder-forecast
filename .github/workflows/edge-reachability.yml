@@ -1,0 +1,71 @@
+name: Edge reachability
+
+# Fetches the R2-backed feeds FROM A GITHUB RUNNER, which sits on a datacentre
+# IP — the exact traffic profile Cloudflare's bot heuristics score worst.
+#
+# WHY THIS EXISTS. On 26-30 Aug 2026 the TrailTether app logged 88 failures
+# fetching the thunder feed, and its own error text named the cause:
+#
+#     HTTP 403 · server=cloudflare · cf-mitigated=challenge
+#              · body="Just a moment..."
+#
+# That is a browser challenge served to a native app, which has no browser to
+# solve it — so the storm veto, the one thing that makes lightning reachable in
+# South Africa, silently stopped being assessed for those users. Every cf-ray
+# in the failures ended -SEA or -ATL (US edges), i.e. VPN and datacentre ranges;
+# South African mobile IPs passed, which is why it cannot be reproduced from a
+# desk in Johannesburg.
+#
+# A runner reproduces the failing profile without needing a VPN. Run it to
+# answer one question: is the challenge still being served?
+#
+# Dispatch-only on purpose — no schedule, so it costs nothing until asked.
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  probe:
+    name: Can a datacentre IP read the feeds?
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: Probe
+        run: |
+          echo "runner egress IP: $(curl -s --max-time 15 https://api.ipify.org || echo unknown)"
+          echo
+
+          probe() {
+            local label="$1" url="$2" ua="$3"
+            # -D - writes headers to stdout so cf-mitigated / cf-ray survive.
+            local out code mitigated ray
+            out=$(curl -s -o /tmp/body -D /tmp/hdr -m 30 -w '%{http_code}' \
+                    ${ua:+-A "$ua"} "$url" || echo "000")
+            code="$out"
+            mitigated=$(grep -i '^cf-mitigated:' /tmp/hdr | tr -d '\r' | cut -d' ' -f2- || true)
+            ray=$(grep -i '^cf-ray:' /tmp/hdr | tr -d '\r' | cut -d' ' -f2- || true)
+            printf '  %-34s HTTP %-4s  cf-mitigated=%-12s cf-ray=%s\n' \
+              "$label" "$code" "${mitigated:-none}" "${ray:-none}"
+            if [ "$code" = "403" ]; then
+              echo "      body: $(head -c 120 /tmp/body | tr -s ' \n' ' ')"
+            fi
+          }
+
+          echo "== the two feeds the APP fetches =="
+          # The app uses Dart's HTTP client; this is its default User-Agent.
+          probe "za-thunder.json.gz (Dart UA)"      "https://tiles.hilltrek.co.za/weather/za-thunder.json.gz"      "Dart/3.5 (dart:io)"
+          probe "za-thunder-grid.json.gz (Dart UA)" "https://tiles.hilltrek.co.za/weather/za-thunder-grid.json.gz" "Dart/3.5 (dart:io)"
+          echo
+          echo "== same host, browser UA (isolates UA from IP reputation) =="
+          probe "za-thunder.json.gz (browser UA)"   "https://tiles.hilltrek.co.za/weather/za-thunder.json.gz"      "Mozilla/5.0 (Linux; Android 14) AppleWebKit/537.36 Chrome/126 Mobile Safari/537.36"
+          echo
+          echo "== the feed the WEBSITE fetches, and a map tile archive =="
+          probe "wx-ensemble.json.gz"               "https://tiles.hilltrek.co.za/weather/wx-ensemble.json.gz"     ""
+          probe "sa-vector-v2.pmtiles (range)"      "https://tiles.hilltrek.co.za/sa-vector-v2.pmtiles"            ""
+          echo
+          echo "Reading this: HTTP 200 everywhere means the challenge is no longer"
+          echo "served to datacentre IPs. A 403 with cf-mitigated=challenge means it"
+          echo "still is, and the app is still losing the storm veto for VPN users."

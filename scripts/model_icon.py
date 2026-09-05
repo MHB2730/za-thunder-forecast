@@ -95,6 +95,12 @@ def fetch_daily(
     per_day: dict[str, dict] = {}
     expected: dict[str, int] = {}
     prev_precip: list[float] | None = None
+    # Separate from `prev_precip is None`, which ALSO goes True after a decode
+    # gap (see the `missing` branch below). Conflating the two used to make a
+    # post-gap step fall into the "nothing to subtract yet" branch and add its
+    # ENTIRE since-run-start TOT_PREC as if it all fell in one 3-hour window —
+    # see the fix note at the `inc` assignment.
+    is_first_step = True
     got = 0
 
     for s in steps:
@@ -131,8 +137,26 @@ def fetch_daily(
             # live file rather than assumed — the same check that caught GFS's
             # overlapping windows and ECMWF's metres.
             cur = reduce_median(vals["precip"], sel[i])
-            inc = cur if prev_precip is None else max(0.0, cur - prev_precip[i])
-            d["precip_sum"][i] += inc
+            if is_first_step:
+                # Nothing decoded yet to subtract -- `cur` really is all the
+                # rain since run start, and none of it has been counted.
+                inc = cur
+            elif prev_precip is None:
+                # A decode gap just happened (see `missing` above): the window
+                # this step's TOT_PREC covers is unknown -- it may span the
+                # whole gap, not one 3-hour step. Substituting `cur` here (the
+                # old bug) added the full since-run-start total as if it fell
+                # in a single window, inflating the day's precip_sum and able
+                # to trigger the `p > 12` / wet-cold vetoes on a day that never
+                # had that rain. Skip this one step's contribution instead,
+                # exactly as model_gfs.py's _incremental() returns None on a
+                # gap -- the day's `complete` flag already tells the consumer
+                # a step was missing.
+                inc = None
+            else:
+                inc = max(0.0, cur - prev_precip[i])
+            if inc is not None:
+                d["precip_sum"][i] += inc
             # VMAX_10M is a maximum over the preceding interval, in m/s.
             d["wind_gust_max"][i] = max(
                 d["wind_gust_max"][i], reduce_median(vals["gust"], sel[i]) * 3.6)
@@ -143,6 +167,7 @@ def fetch_daily(
             if w > d["weather_code"][i]:
                 d["weather_code"][i] = w
         prev_precip = [reduce_median(vals["precip"], sel[i]) for i in range(len(points))]
+        is_first_step = False
         d["steps"] += 1
         got += 1
         if got % 5 == 0:

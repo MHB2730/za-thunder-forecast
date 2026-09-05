@@ -213,6 +213,12 @@ def fetch_daily(
     steps = list(range(3, hours + 1, 3))
     sel = None
     prev_tp: list[float] | None = None
+    # Separate from `prev_tp is None`, which ALSO goes True after a decode gap
+    # (see the two `prev_tp = None` sites below). Conflating the two used to
+    # send a post-gap step down the "nothing to subtract yet" branch and add
+    # its ENTIRE since-run-start `tp` as if it all fell in one 3-hour window —
+    # see the fix note at the `inc_m` assignment.
+    is_first_step = True
     per_day: dict[str, dict] = {}
     expected: dict[str, int] = {}
     got = 0
@@ -263,13 +269,32 @@ def fetch_daily(
             # by the number of steps, and forgetting the unit multiplies by
             # 1000. The empirical check is in the commit message.
             cur_m = tp_pt[i]
-            inc_m = cur_m if prev_tp is None else max(0.0, cur_m - prev_tp[i])
-            d["precip_sum"][i] += inc_m * 1000.0
+            if is_first_step:
+                # Nothing decoded yet to subtract -- `cur_m` really is all the
+                # rain since run start, and none of it has been counted.
+                inc_m = cur_m
+            elif prev_tp is None:
+                # A decode gap just happened (see the `prev_tp = None` sites
+                # above): the window this step's `tp` covers is unknown -- it
+                # may span the whole gap, not one 3-hour step. Substituting
+                # `cur_m` here (the old bug) added the full since-run-start
+                # total as if it fell in a single window, inflating the day's
+                # precip_sum and able to trigger a false `p > 12` / wet-cold
+                # veto. Skip this one step's contribution instead, exactly as
+                # model_gfs.py's _incremental() returns None on a gap -- the
+                # day's `complete` flag already tells the consumer a step was
+                # missing.
+                inc_m = None
+            else:
+                inc_m = max(0.0, cur_m - prev_tp[i])
+            if inc_m is not None:
+                d["precip_sum"][i] += inc_m * 1000.0
             if gust_pt is not None:
                 d["wind_gust_max"][i] = max(d["wind_gust_max"][i], gust_pt[i] * 3.6)
             c = t2_pt[i] - 273.15
             d["temp_min"][i] = c if d["temp_min"][i] is None else min(d["temp_min"][i], c)
         prev_tp = tp_pt
+        is_first_step = False
         d["steps"] += 1
         if gust_pt is not None:
             d["gust_steps"] += 1

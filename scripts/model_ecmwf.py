@@ -63,11 +63,15 @@ import urllib.request
 import eccodes as ec
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+from runs import day_complete, pick_run  # noqa: E402
 from spatial import (  # noqa: E402
     DEFAULT_RADIUS_KM, cells_within_km, describe, reduce_max, reduce_median,
 )
 
 BASE = "https://data.ecmwf.int/forecasts"
+# Only the 00Z and 12Z `oper` runs reach +120 h; 06Z/18Z stop at +90 h and
+# live under a different stream, so they are never candidates.
+CYCLES = (0, 12)
 UA = "TrailTether/2.0 (https://trailtether.app contact@hilltrek.co.za)"
 MODEL = "ECMWF IFS 0.25° (open data)"
 LICENCE = "ECMWF IFS open data — CC BY 4.0"
@@ -134,6 +138,19 @@ def _get(url: str, rng: tuple[int, int] | None = None,
 def _stem(run_day: str, cycle: int, step: int) -> str:
     return (f"{BASE}/{run_day}/{cycle:02d}z/ifs/0p25/oper/"
             f"{run_day}{cycle:02d}0000-{step}h-oper-fc")
+
+
+def _published(run: dt.datetime, step: int) -> bool:
+    """True when `step` of `run` is on data.ecmwf.int (a HEAD of its .index)."""
+    url = _stem(run.strftime("%Y%m%d"), run.hour, step) + ".index"
+    req = urllib.request.Request(url, method="HEAD", headers={"User-Agent": UA})
+    try:
+        with urllib.request.urlopen(req, timeout=30) as r:
+            return r.status == 200
+    except urllib.error.HTTPError as e:
+        if e.code == 404:
+            return False
+        raise
 
 
 def _sample_messages(raw: bytes, points: list[tuple[float, float]]) -> dict:
@@ -203,14 +220,19 @@ def fetch_daily(
     Same fail-safe contract as the other adapters: a day is `complete` only if
     every step covering it decoded.
     """
-    now = dt.datetime.now(dt.timezone.utc)
-    if run_day is None:
-        run_day = (now - dt.timedelta(days=1)).strftime("%Y%m%d")
-    run_dt = dt.datetime.strptime(run_day, "%Y%m%d").replace(
-        hour=cycle, tzinfo=dt.timezone.utc
-    )
-
     steps = list(range(3, hours + 1, 3))
+    if run_day is None:
+        # The NEWEST run whose last step is out. ⚠️ This used to be yesterday's
+        # 00Z, which left every build 30-44 h stale — see runs.py.
+        run_dt = pick_run(dt.datetime.now(dt.timezone.utc), CYCLES,
+                          lambda r: _published(r, steps[-1]), log=log)
+        run_day, cycle = run_dt.strftime("%Y%m%d"), run_dt.hour
+    else:
+        run_dt = dt.datetime.strptime(run_day, "%Y%m%d").replace(
+            hour=cycle, tzinfo=dt.timezone.utc
+        )
+    log(f"  ECMWF run {run_dt:%Y-%m-%d %HZ}")
+
     sel = None
     prev_tp: list[float] | None = None
     # Separate from `prev_tp is None`, which ALSO goes True after a decode gap
@@ -303,7 +325,9 @@ def fetch_daily(
             log(f"  ECMWF +{s:03d}h ok ({got}/{len(steps)})")
 
     for key, d in per_day.items():
-        d["complete"] = d["steps"] == expected.get(key, 0)
+        # Whole days only — see runs.py. A run ending at 02:00 SAST used to
+        # hand its last date ONE night-time step and call that day complete.
+        d["complete"] = day_complete(d["steps"], expected.get(key, 0))
         # Assessed only if EVERY step of the day carried a gust — see the note
         # on `gust_steps`. Days past +90 h come back False and the ladder then
         # abstains on wind instead of reading a missing gust as 0 km/h.

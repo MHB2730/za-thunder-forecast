@@ -29,7 +29,10 @@ FAIL-SAFE CONTRACT — same as the thunder feed
 ---------------------------------------------
   * A day is only reported for a model if that model decoded every step
     covering it. Otherwise the model is `complete: false` for that day and the
-    UI must show it as unknown, not as a clear vote.
+    UI must show it as unknown, not as a clear vote. That includes the days a
+    run only partly spans — its first and last — see runs.py.
+  * Each model uses its newest fully-published run, and one older than
+    MAX_RUN_AGE_H at build time is dropped rather than allowed to vote.
   * If fewer than `--min-models` models produce anything, the script EXITS
     NON-ZERO and writes nothing. A stale-but-honest artifact beats a fresh
     file that under-counts the models condemning a day.
@@ -48,6 +51,7 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import model_ecmwf  # noqa: E402
 import model_gfs  # noqa: E402
 import model_icon  # noqa: E402
+from runs import MAX_RUN_AGE_H  # noqa: E402
 from spatial import DEFAULT_RADIUS_KM  # noqa: E402
 from veto import evaluate_hazards  # noqa: E402
 
@@ -141,13 +145,27 @@ def main() -> int:
             # One provider being down must not take the whole feed with it; the
             # min-models gate below decides whether what survived is publishable.
             log(f"  {mid} FAILED entirely: {type(e).__name__}: {e}")
+            continue
+        # Backstop for runs.py's picker. ⚠️ Until 2026-10-16 GFS and ECMWF were
+        # 30-44 h old on every build and nothing said so; an old run is a
+        # forecast about a weather situation that no longer exists, and it must
+        # not vote beside a fresh one as if the two were peers.
+        age_h = (dt.datetime.now(dt.timezone.utc)
+                 - dt.datetime.fromisoformat(results[mid]["run"])).total_seconds() / 3600
+        if age_h > MAX_RUN_AGE_H:
+            log(f"  {mid} run {results[mid]['run']} is {age_h:.0f} h old "
+                f"(max {MAX_RUN_AGE_H}) — dropped")
+            del results[mid]
 
     if len(results) < a.min_models:
         log(f"FATAL: only {len(results)} model(s) succeeded (min {a.min_models}). "
             "Refusing to publish — the last good artifact stands.")
         return 1
 
-    days = sorted({d for r in results.values() for d in r["days"]})
+    # Today onwards (SAST). A run that starts before midnight hands back
+    # yesterday's date too, and a day already over is not a forecast.
+    today = dt.datetime.now(model_gfs.SAST).strftime("%Y-%m-%d")
+    days = sorted({d for r in results.values() for d in r["days"] if d >= today})
     verdicts: list[dict] = []
     for i, loc in enumerate(LOCATIONS):
         by_day: dict[str, dict] = {}

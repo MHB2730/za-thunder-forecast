@@ -46,6 +46,7 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from fetch_dwd_thunder import (  # noqa: E402
     BASE, FETCH_ERRORS, SAST, cell_index, fetch, grib_values, latest_run,
 )
+from runs import day_complete  # noqa: E402
 from spatial import (  # noqa: E402
     DEFAULT_RADIUS_KM, cells_within_km, describe, reduce_max, reduce_median,
 )
@@ -174,7 +175,9 @@ def fetch_daily(
             log(f"  ICON +{s:03d}h ok ({got}/{len(steps)})")
 
     for key, d in per_day.items():
-        d["complete"] = d["steps"] == expected.get(key, 0)
+        # Whole days only — see runs.py. A 12Z run's last date ends at 14:00
+        # SAST and used to vote as if the afternoon had been looked at.
+        d["complete"] = day_complete(d["steps"], expected.get(key, 0))
 
     return {
         "model": MODEL,

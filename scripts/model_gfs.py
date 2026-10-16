@@ -55,11 +55,17 @@ import urllib.request
 import eccodes as ec
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+from runs import day_complete, pick_run  # noqa: E402
 from spatial import (  # noqa: E402
     DEFAULT_RADIUS_KM, cells_within_km, describe, reduce_max, reduce_median,
 )
 
 FILTER = "https://nomads.ncep.noaa.gov/cgi-bin/filter_gfs_0p25_1hr.pl"
+# The files the filter cuts from, read directly only to ask "is this step out
+# yet": a step's .idx is written after its GRIB, so its presence is the signal.
+PROD = "https://nomads.ncep.noaa.gov/pub/data/nccf/com/gfs/prod"
+# GFS runs four times a day, every cycle well past +120 h.
+CYCLES = (0, 6, 12, 18)
 UA = "TrailTether/2.0 (https://trailtether.app contact@hilltrek.co.za)"
 MODEL = "NOAA GFS 0.25°"
 LICENCE = "NOAA/NCEP GFS — public domain (17 U.S.C. §105)"
@@ -120,6 +126,20 @@ def _url(run_day: str, cycle: int, step: int, bbox: tuple[float, float, float, f
         f"&subregion=&leftlon={w}&rightlon={e}&toplat={n}&bottomlat={s}"
         f"&dir=%2Fgfs.{run_day}%2F{cycle:02d}%2Fatmos"
     )
+
+
+def _published(run: dt.datetime, step: int) -> bool:
+    """True when `step` of `run` is on NOMADS (a HEAD of its .idx)."""
+    url = (f"{PROD}/gfs.{run:%Y%m%d}/{run:%H}/atmos/"
+           f"gfs.t{run:%H}z.pgrb2.0p25.f{step:03d}.idx")
+    req = urllib.request.Request(url, method="HEAD", headers={"User-Agent": UA})
+    try:
+        with urllib.request.urlopen(req, timeout=30) as r:
+            return r.status == 200
+    except urllib.error.HTTPError as e:
+        if e.code == 404:
+            return False
+        raise
 
 
 def _fetch(url: str, timeout: int = 90, attempts: int = 3) -> bytes:
@@ -210,22 +230,25 @@ def fetch_daily(
     `complete` if every step covering it decoded. An incomplete day must be
     rendered as unknown, never as a quiet all-clear.
     """
-    now = dt.datetime.now(dt.timezone.utc)
+    steps = list(range(3, hours + 1, 3))
     if run_day is None:
-        # Yesterday's cycle is certainly published; today's may still be
-        # uploading. The ensemble is a day-scale product, so preferring a
-        # complete older run to a half-published newer one is the right trade.
-        run_day = (now - dt.timedelta(days=1)).strftime("%Y%m%d")
-    run_dt = dt.datetime.strptime(run_day, "%Y%m%d").replace(
-        hour=cycle, tzinfo=dt.timezone.utc
-    )
+        # The NEWEST run whose last step is out. ⚠️ This used to be "yesterday's
+        # 00Z, certainly published", which left every build 30-44 h stale and
+        # up to three cycles behind what NOMADS already had — see runs.py.
+        run_dt = pick_run(dt.datetime.now(dt.timezone.utc), CYCLES,
+                          lambda r: _published(r, steps[-1]), log=log)
+        run_day, cycle = run_dt.strftime("%Y%m%d"), run_dt.hour
+    else:
+        run_dt = dt.datetime.strptime(run_day, "%Y%m%d").replace(
+            hour=cycle, tzinfo=dt.timezone.utc
+        )
+    log(f"  GFS run {run_dt:%Y-%m-%d %HZ}")
 
     lats = [p[0] for p in points]
     lons = [p[1] for p in points]
     pad = 1.0
     bbox = (min(lats) - pad, min(lons) - pad, max(lats) + pad, max(lons) + pad)
 
-    steps = list(range(3, hours + 1, 3))
     # Computed once from the first decoded grid: the grid is constant across
     # steps, and recomputing per step would be wasted work, not safety.
     sel = None
@@ -287,7 +310,9 @@ def fetch_daily(
             log(f"  GFS +{s:03d}h ok ({got}/{len(steps)})")
 
     for key, d in per_day.items():
-        d["complete"] = d["steps"] == expected.get(key, 0)
+        # Whole days only — see runs.py. A run ending at 02:00 SAST used to
+        # hand its last date ONE night-time step and call that day complete.
+        d["complete"] = day_complete(d["steps"], expected.get(key, 0))
 
     return {
         "model": MODEL,

@@ -37,7 +37,8 @@ What the file holds, and why:
   values (`data/za-gust-mask.json`, built by `scripts/build_gust_mask.py`);
   the rest carry `unknown` (255). That keeps the file around 180 KiB instead
   of 520.
-* **Fail-safe.** Below `--min-steps` (90 of 112) decoded hours the script
+* **Fail-safe.** Below `--min-steps` (80 % of the hours requested: 90 of 112 for
+  the 00/12 UTC runs, 74 of 92 for 06/18, which DWD runs only to +120 h) the script
   exits non-zero and writes nothing; the app ages the last good file out to
   "no gust forecast" after 30 h. A day with nothing decoded has no planes and
   reads as unknown, never calm.

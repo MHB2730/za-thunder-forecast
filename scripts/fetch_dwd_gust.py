@@ -78,8 +78,21 @@ from fetch_dwd_thunder import (  # noqa: E402
 )
 from spatial import DEFAULT_RADIUS_KM, KM_PER_DEG  # noqa: E402
 
-# Hourly to +78 h (all that exists there), 3-hourly to +180 h after it.
-DEFAULT_STEPS = list(range(1, 79)) + list(range(81, 181, 3))
+# Hourly to +78 h (all that exists there), 3-hourly after it — to +180 h for
+# the 00 and 12 UTC runs, but only to +120 h for 06 and 18 UTC, which DWD runs
+# shorter. Asking for hours a run does not have is 20 guaranteed 404s, and it
+# left a 06/18 run (92 of 112) two failed downloads from refusing to publish
+# good data. The thunder job's 41 of 61 on the same runs is the same cause.
+def default_steps(run: str) -> list[int]:
+    last = 120 if run[-2:] in ("06", "18") else 180
+    return list(range(1, 79)) + list(range(81, last + 1, 3))
+
+
+# Publish only when at least this share of the requested hours decoded. A
+# short day is published as "at least", so a few lost hours cost precision,
+# not honesty; the floor exists so a mostly-failed run cannot replace a good
+# file with a near-empty one.
+MIN_SHARE = 0.8
 
 UNKNOWN = 255  # a cell outside the mask; a block with no data is null instead
 MAX_KMH = 254  # cap, so a real gust can never collide with UNKNOWN
@@ -156,13 +169,15 @@ def main() -> int:
     ap.add_argument(
         "--min-steps",
         type=int,
-        default=90,
-        help="refuse to publish below this many decoded steps (fail-safe)",
+        help="refuse to publish below this many decoded steps "
+             f"(default {MIN_SHARE:.0%} of those requested)",
     )
     a = ap.parse_args()
 
     run = a.run or latest_run(dt.datetime.now(dt.timezone.utc))
-    steps = [int(s) for s in a.steps.split(",")] if a.steps else DEFAULT_STEPS
+    steps = [int(s) for s in a.steps.split(",")] if a.steps else default_steps(run)
+    min_steps = (a.min_steps if a.min_steps is not None
+                 else int(np.ceil(MIN_SHARE * len(steps))))
     run_dt = dt.datetime.strptime(run, "%Y%m%d%H").replace(tzinfo=dt.timezone.utc)
 
     log(f"DWD ICON global VMAX_10M — run {run} ({len(steps)} steps requested)")
@@ -218,8 +233,8 @@ def main() -> int:
     if saved:
         np.savez_compressed(a.raw, **saved)
     log(f"decoded {got}/{len(steps)} steps")
-    if got < a.min_steps:
-        log(f"FATAL: only {got} steps decoded (min {a.min_steps}). "
+    if got < min_steps:
+        log(f"FATAL: only {got} steps decoded (min {min_steps}). "
             "Refusing to publish a partial file — the last good artifact stands.")
         return 1
 

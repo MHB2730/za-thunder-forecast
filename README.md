@@ -7,6 +7,44 @@ open data, four times a day, and publishes it as a small static file that
 Output: `https://tiles.hilltrek.co.za/weather/za-thunder.json.gz` (plus a
 static `za-thunder-grid.json.gz` carrying the cell coordinates).
 
+Since 16 Oct 2026 the same job also publishes **wind gusts**:
+`https://tiles.hilltrek.co.za/weather/za-gust.json.gz`, on the same cells.
+
+## Wind gusts (`scripts/fetch_dwd_gust.py`)
+
+met.no publishes `wind_speed_of_gust` only inside its Nordic model. Probed on
+2026-10-16: 0 of 90 hourly blocks at 13 South African points (Berg, Cape,
+Cederberg, Swartberg, Otter, Amatola, Magaliesberg, Blyde, Durban) in both its
+`complete` and `compact` products, and none at London, Berlin, Madrid or
+Nairobi; Oslo had 53 of 84. So every gust check in TrailTether ran on mean wind
+or never fired. On 19 Oct 2026 the global models agreed on 100–132 km/h gusts
+at Sani Pass while met.no's mean there was 28 km/h.
+
+What the file holds, and why:
+
+* **The field.** `VMAX_10M` (`max_i10fg`), checked against the live files: the
+  maximum gust over the **preceding one hour** at every step, including past
+  +78 h where ICON global only outputs every third hour. So every hour to +78 h
+  is fetched (sampling every third would miss two thirds of the gusts), and
+  past +78 h the published figure is honestly an **"at least"**.
+* **The shape.** Per SAST day: eight 3-hour blocks when every hour was read
+  (`full: true`), otherwise one `max` plane that is a lower bound. `cover` and
+  `expect` give the hours read and the hours possible per block.
+* **An area figure.** Each cell is the median of all cells within 25 km (the
+  ensemble's reduction, see `spatial.py`), so one windy cell on the escarpment
+  cannot stand for the area. km/h, rounded up.
+* **A mask.** Only cells within 30 km of South Africa (Lesotho included) carry
+  values (`data/za-gust-mask.json`, built by `scripts/build_gust_mask.py`);
+  the rest carry `unknown` (255). That keeps the file around 180 KiB instead
+  of 520.
+* **Fail-safe.** Below `--min-steps` (90 of 112) decoded hours the script
+  exits non-zero and writes nothing; the app ages the last good file out to
+  "no gust forecast" after 30 h. A day with nothing decoded has no planes and
+  reads as unknown, never calm.
+
+It runs in the same workflow, after thunder is published and independent of
+it. Attribution: the same DWD notice, with the modification stated.
+
 ## Why this exists
 
 TrailTether's hiking score has a thunderstorm veto — the app's own comment calls

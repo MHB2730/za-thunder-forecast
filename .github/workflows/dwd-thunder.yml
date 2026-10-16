@@ -65,7 +65,9 @@ jobs:
   build:
     name: Build & publish ZA thunder forecast
     runs-on: ubuntu-latest
-    timeout-minutes: 30
+    # 30 for thunder alone (3-7 min a run); the gust build adds ~6 min and
+    # ~450 MB of downloads (every hour to +78 h — see fetch_dwd_gust.py).
+    timeout-minutes: 45
 
     steps:
       - uses: actions/checkout@v7
@@ -122,6 +124,36 @@ jobs:
           # also change grid_id and force the app to refetch.
           rclone copyto out/za-thunder-grid.json.gz r2:tt-tiles/weather/za-thunder-grid.json.gz \
             --s3-no-check-bucket --header-upload "Cache-Control: public, max-age=604800"
+
+      # WIND GUSTS — same model, same run, same cells. met.no publishes no
+      # gusts outside its Nordic model (0 of 90 hours at 13 SA points,
+      # 2026-10-16), so this file is the only gust forecast the app has in
+      # South Africa. See the header of scripts/fetch_dwd_gust.py.
+      #
+      # Runs AFTER thunder is published and even if thunder failed
+      # (`!cancelled()`): the two are independent, and neither may take the
+      # other down. A gust failure still turns the run red — that is the
+      # signal — and the last good gust file stays in R2 until the app ages
+      # it out to "no gust forecast" after 30 h.
+      - name: Build gust forecast
+        if: ${{ !cancelled() }}
+        run: |
+          python scripts/fetch_dwd_gust.py             --out out/za-gust.json.gz             --cache .dwd-cache             ${{ github.event.inputs.run && format('--run {0}', github.event.inputs.run) || '' }}
+
+      # Only reached with a complete file: the script exits non-zero and writes
+      # nothing when too few hours decoded.
+      - name: Publish gust forecast to R2
+        if: ${{ !cancelled() && hashFiles('out/za-gust.json.gz') != '' }}
+        env:
+          RCLONE_CONFIG_R2_TYPE: s3
+          RCLONE_CONFIG_R2_PROVIDER: Cloudflare
+          RCLONE_CONFIG_R2_ACCESS_KEY_ID: ${{ secrets.R2_ACCESS_KEY_ID }}
+          RCLONE_CONFIG_R2_SECRET_ACCESS_KEY: ${{ secrets.R2_SECRET_ACCESS_KEY }}
+          RCLONE_CONFIG_R2_ENDPOINT: ${{ secrets.R2_ENDPOINT }}
+          RCLONE_CONFIG_R2_ACL: private
+        run: |
+          command -v rclone >/dev/null || curl -fsSL https://rclone.org/install.sh | sudo bash
+          rclone copyto out/za-gust.json.gz r2:tt-tiles/weather/za-gust.json.gz             --s3-no-check-bucket --header-upload "Cache-Control: public, max-age=1800"
 
       # Keeps the last build inspectable even if the R2 step fails, so a
       # publish problem can be told apart from a data problem.

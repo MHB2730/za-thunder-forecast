@@ -62,7 +62,7 @@ jobs:
           echo "== same host, browser UA (isolates UA from IP reputation) =="
           probe "za-thunder.json.gz (browser UA)"   "https://tiles.hilltrek.co.za/weather/za-thunder.json.gz"      "Mozilla/5.0 (Linux; Android 14) AppleWebKit/537.36 Chrome/126 Mobile Safari/537.36"
           echo
-          echo "== the feed the WEBSITE fetches, and a map tile archive =="
+          echo "== a retired feed (wx-ensemble, unread since 2026-09-17) and a map tile archive =="
           probe "wx-ensemble.json.gz"               "https://tiles.hilltrek.co.za/weather/wx-ensemble.json.gz"     ""
           probe "sa-vector-v2.pmtiles (range)"      "https://tiles.hilltrek.co.za/sa-vector-v2.pmtiles"            ""
           echo

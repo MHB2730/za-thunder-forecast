@@ -20,19 +20,22 @@ name: wx-ensemble
 #      marketing feature's outage on a safety feed's status light.
 #
 # Separate workflows, separate signals. Red here means the ensemble failed.
+#
+# 🛑 RETIRED 2026-10-19 (owner's word: "retire it"). Nothing reads the output:
+# the /trailtether/ page's ensemble panel was deleted in the 2026-09-17 audit
+# (S-1; hilltrek-site/test/berg-live.js guards that it stays deleted), and
+# neither the app nor any Supabase function ever fetched wx-ensemble.json.gz.
+# It was still pulling ~530 MB of ICON from DWD per run, twice a day, for a
+# file nobody opened. The workflow is disabled on GitHub and the schedule is
+# removed here, so re-enabling it does not quietly bring the cron back. The
+# last file published (18 Oct) stays on R2; nothing reads it.
+# The scripts stay: `runs.py` (pick_run, day_complete) and the model adapters
+# are reused by the mountain-weather job planned in trailtether's
+# SCOPE-3d-weather.md. Manual runs still work (workflow_dispatch) once enabled.
 
 on:
-  schedule:
-    # Twice a day, after the 00Z and 12Z ICON runs publish (DWD is ~3-4 h
-    # behind its nominal time). Times are UTC; SAST is +2.
-    #
-    # ⚠️ TWICE, not four times like the thunder feed, and that is a cost
-    # decision rather than an oversight. ICON global has no subregion or
-    # variable filter, so the four fields cost ~530 MB per run against the
-    # thunder feed's single WW field. This is a FIVE-DAY OUTLOOK for trip
-    # planning — it does not get meaningfully better by rebuilding every six
-    # hours, and the bandwidth is somebody else's free service.
-    - cron: '45 5,17 * * *'
+  # schedule removed 2026-10-19 (retired, see above). It was
+  # `45 5,17 * * *`: twice a day, after the 00Z and 12Z ICON runs.
   workflow_dispatch:
     inputs:
       hours:

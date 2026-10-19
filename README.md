@@ -46,6 +46,29 @@ What the file holds, and why:
 It runs in the same workflow, after thunder is published and independent of
 it. Attribution: the same DWD notice, with the modification stated.
 
+## Mountain weather (`scripts/fetch_gfs_mountain.py`, since 19 Oct 2026)
+
+NOAA GFS 0.25° on eleven pressure levels (1000-500 hPa) over South Africa,
+four times a day, cut into 47 area files of 2° x 2° that the app caches
+offline: `https://tiles.hilltrek.co.za/weather/mtn/v1/<s30e028>.json.gz`
+(about 110 KiB each) plus `index.json`. The phone reads the model's 3D air
+at the REAL height of the ground: GFS puts Mafadi's ground at 2,395 m (the
+summit is 3,444 m). Plan and evidence: trailtether `SCOPE-3d-weather.md` and
+`design/weather_3d_prototype_2026-10/` (six-week check against balloons,
+stations and satellite).
+
+* Same fail-safe contract as thunder and gusts: a step that did not decode is
+  all-unknown (255), fewer than 80 % of steps writes nothing, and a sanity stop
+  checks physical limits before anything is written.
+* Rain is the mean rate since the previous step, from GFS's 6-hour APCP
+  buckets (`rain_between`, reusing `model_gfs.block_start`).
+* Humidity is shipped for the app's cloud guess, which the six-week check
+  found wrong about 2 times in 3 on the summits; the app must label it so.
+* Separate workflow (`gfs-mountain.yml`) so it can never touch the thunder
+  feed's status. Tests: `python scripts/test_mountain.py`.
+* Tile list: `data/mtn-tiles.json` from `scripts/build_mtn_tiles.py`.
+* Licence: public domain (17 U.S.C. §105); credited as NOAA GFS in the app.
+
 ## Why this exists
 
 TrailTether's hiking score has a thunderstorm veto — the app's own comment calls

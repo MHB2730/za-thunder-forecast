@@ -1,0 +1,85 @@
+name: GFS mountain weather
+
+# Builds TrailTether's mountain-weather area files (snow line, rain, wind and
+# temperature at the real height of the ground, and a labelled cloud guess)
+# from NOAA GFS, and publishes them to R2 under weather/mtn/v1/.
+#
+# Plan: trailtether SCOPE-3d-weather.md. Script: scripts/fetch_gfs_mountain.py.
+#
+# ⚠️ A SEPARATE WORKFLOW FROM dwd-thunder.yml, for the reason that file and the
+# retired wx-ensemble.yml both give: the thunder feed is a live safety
+# dependency, and a failure here must never delay it or show on its status
+# light. Red here means the MOUNTAIN files failed, nothing else.
+#
+# FAIL-SAFE: the script exits non-zero and writes nothing when fewer than 80 %
+# of the steps decode, or when the sanity stop fires. Publish is a separate
+# step, so a failed build never overwrites good files; the app ages the last
+# good ones out to "no mountain forecast" after 30 h.
+
+on:
+  schedule:
+    # GFS 0.25 deg reaches +168 h about 4 h 40 min after its nominal time.
+    # Ten minutes after the thunder job; runs.pick_run falls back to the
+    # previous cycle if this one is not fully out yet.
+    - cron: '40 4,10,16,22 * * *'
+  workflow_dispatch:
+    inputs:
+      run:
+        description: 'GFS run YYYYMMDDHH (default: newest fully published)'
+        required: false
+
+concurrency:
+  group: gfs-mountain
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    name: Build & publish mountain weather
+    runs-on: ubuntu-latest
+    # ~49 small NOMADS requests 1.2 s apart plus decoding: 3-5 min.
+    timeout-minutes: 30
+
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: actions/setup-python@v7
+        with:
+          python-version: '3.12'
+
+      - name: Install ecCodes
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y --no-install-recommends libeccodes0 libeccodes-dev
+          python -m pip install --upgrade pip
+          pip install numpy eccodes
+
+      - name: Test
+        run: python scripts/test_mountain.py
+
+      - name: Build area files
+        run: |
+          python scripts/fetch_gfs_mountain.py --out out/mtn/v1 \
+            ${{ github.event.inputs.run && format('--run {0}', github.event.inputs.run) || '' }}
+
+      # Area files first, the index last: a reader of the index never finds a
+      # run whose area files are not up yet.
+      - name: Publish to R2
+        env:
+          RCLONE_CONFIG_R2_TYPE: s3
+          RCLONE_CONFIG_R2_PROVIDER: Cloudflare
+          RCLONE_CONFIG_R2_ACCESS_KEY_ID: ${{ secrets.R2_ACCESS_KEY_ID }}
+          RCLONE_CONFIG_R2_SECRET_ACCESS_KEY: ${{ secrets.R2_SECRET_ACCESS_KEY }}
+          RCLONE_CONFIG_R2_ENDPOINT: ${{ secrets.R2_ENDPOINT }}
+          RCLONE_CONFIG_R2_ACL: private
+        run: |
+          curl -fsSL https://rclone.org/install.sh | sudo bash
+          # --s3-no-check-bucket is REQUIRED (R2 answers CreateBucket with 403).
+          rclone copy out/mtn/v1 r2:tt-tiles/weather/mtn/v1 \
+            --include "*.json.gz" --s3-no-check-bucket \
+            --header-upload "Cache-Control: public, max-age=1800" \
+            --header-upload "Content-Type: application/gzip"
+          rclone copyto out/mtn/v1/index.json r2:tt-tiles/weather/mtn/v1/index.json \
+            --s3-no-check-bucket --header-upload "Cache-Control: public, max-age=600"

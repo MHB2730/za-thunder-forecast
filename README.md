@@ -46,6 +46,17 @@ What the file holds, and why:
 It runs in the same workflow, after thunder is published and independent of
 it. Attribution: the same DWD notice, with the modification stated.
 
+## 10 m wind (`scripts/fetch_dwd_wind.py`, since 11 Nov 2026)
+
+`https://tiles.hilltrek.co.za/weather/za-wind.json.gz`: ICON `U_10M` / `V_10M`
+(m/s, eastward / northward) for every cell of the thunder grid, every hour from
++0 to +30 h of the run, for the map's wind streaks. Each step is one base64
+int8 plane per component at 0.5 m/s (clamped to ±63.5); the exact schema is in
+the script header. No area median and no mask. A step that did not decode is
+left out of `steps` (never zeroed); under 80 % of the hours, or a grid that
+does not match `za-thunder-grid.json.gz`, writes nothing. Same workflow, after
+gusts, and unable to stop either. Tests: `python scripts/test_wind_grid.py`.
+
 ## Mountain weather (`scripts/fetch_gfs_mountain.py`, since 19 Oct 2026)
 
 NOAA GFS 0.25° on eleven pressure levels (1000-500 hPa) over South Africa,

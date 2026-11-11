@@ -66,8 +66,9 @@ jobs:
     name: Build & publish ZA thunder forecast
     runs-on: ubuntu-latest
     # 30 for thunder alone (3-7 min a run); the gust build adds ~6 min and
-    # ~450 MB of downloads (every hour to +78 h — see fetch_dwd_gust.py).
-    timeout-minutes: 45
+    # ~450 MB of downloads (every hour to +78 h — see fetch_dwd_gust.py); the
+    # wind build adds ~240 MB (u and v, every hour to +30 h — fetch_dwd_wind.py).
+    timeout-minutes: 55
 
     steps:
       - uses: actions/checkout@v7
@@ -154,6 +155,36 @@ jobs:
         run: |
           command -v rclone >/dev/null || curl -fsSL https://rclone.org/install.sh | sudo bash
           rclone copyto out/za-gust.json.gz r2:tt-tiles/weather/za-gust.json.gz             --s3-no-check-bucket --header-upload "Cache-Control: public, max-age=1800"
+
+      # 10 m WIND (U_10M/V_10M) — every hour +0..+30 h, every thunder-grid
+      # cell, int8 at 0.5 m/s, for the map's wind streaks. See the header of
+      # scripts/fetch_dwd_wind.py for the schema.
+      #
+      # Same independence rule as gusts: runs after thunder and gust publish
+      # and even if either failed (`!cancelled()`), so a wind failure can never
+      # stop thunder or gust reaching R2. Its offline test runs first, so a
+      # broken encoder fails here instead of publishing. The script checks
+      # grid_id against out/za-thunder-grid.json.gz when thunder built one.
+      - name: Build wind forecast
+        if: ${{ !cancelled() }}
+        run: |
+          python scripts/test_wind_grid.py
+          python scripts/fetch_dwd_wind.py             --out out/za-wind.json.gz             --cache .dwd-cache             ${{ github.event.inputs.run && format('--run {0}', github.event.inputs.run) || '' }}
+
+      # Only reached with a complete file: the script exits non-zero and writes
+      # nothing when too few hours decoded or the grid does not match.
+      - name: Publish wind forecast to R2
+        if: ${{ !cancelled() && hashFiles('out/za-wind.json.gz') != '' }}
+        env:
+          RCLONE_CONFIG_R2_TYPE: s3
+          RCLONE_CONFIG_R2_PROVIDER: Cloudflare
+          RCLONE_CONFIG_R2_ACCESS_KEY_ID: ${{ secrets.R2_ACCESS_KEY_ID }}
+          RCLONE_CONFIG_R2_SECRET_ACCESS_KEY: ${{ secrets.R2_SECRET_ACCESS_KEY }}
+          RCLONE_CONFIG_R2_ENDPOINT: ${{ secrets.R2_ENDPOINT }}
+          RCLONE_CONFIG_R2_ACL: private
+        run: |
+          command -v rclone >/dev/null || curl -fsSL https://rclone.org/install.sh | sudo bash
+          rclone copyto out/za-wind.json.gz r2:tt-tiles/weather/za-wind.json.gz             --s3-no-check-bucket --header-upload "Cache-Control: public, max-age=1800"
 
       # Keeps the last build inspectable even if the R2 step fails, so a
       # publish problem can be told apart from a data problem.
